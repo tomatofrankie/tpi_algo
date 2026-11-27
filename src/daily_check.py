@@ -31,11 +31,10 @@ Usage:
 
 import argparse
 import sys
+import os
 from pathlib import Path
 from typing import Optional
 import pandas as pd
-
-
 
 def _ensure_import_paths() -> None:
     """Ensures sibling `backtest.py` is importable whether run from root, `src/`, or an IDE."""
@@ -49,7 +48,6 @@ def _ensure_import_paths() -> None:
 
 
 _ensure_import_paths()
-
 from backtest import (  # noqa: E402
     build_aligned_market_panel,
     compute_smoothed_signals,
@@ -60,11 +58,7 @@ from backtest import (  # noqa: E402
     setup_monthly_logger,
 )
 
-
-# ==============================================================================
-# 1. SNAPSHOT BUILDER & MONTHLY CSV SIGNAL LOGGER
-# ==============================================================================
-
+# ==============================================================================# 1. SNAPSHOT BUILDER, TELEGRAM NOTIFIER & MONTHLY CSV SIGNAL LOGGER# ==============================================================================
 
 def build_live_signal_snapshot(
     signals: pd.DataFrame,
@@ -151,6 +145,113 @@ def build_live_signal_snapshot(
         ),
     }
 
+def format_telegram_message(snapshot: dict, ema_span: int = 25) -> str:
+    """Builds a clean, mobile-friendly Telegram message from the daily snapshot."""
+    is_def = snapshot["active_regime"] == "DEFENSIVE"
+    status_badge = "DEFENSIVE (RISK-OFF)" if is_def else "RISK-ON (BULLISH)"
+    header = (
+        f"🚨 *REGIME FLIP DETECTED: {status_badge}*"
+        if snapshot["flipped_today"]
+        else f"📊 *AI Token & Semi Signal: {status_badge}*"
+    )
+
+    if is_def:
+        streak_line = (
+            f"Exit Streak: `{snapshot['exit_streak']}` | "
+            f"Re-Enter TPI: `>${snapshot['tpi_price']:.2f}` or `>=${snapshot['next_friday_tpi_exit_trigger']:.2f}`"
+        )
+    else:
+        streak_line = (
+            f"Entry Streak: `{snapshot['entry_streak']}` | "
+            f"Defensive TPI: `<=${snapshot['next_friday_tpi_entry_trigger']:.2f}`"
+        )
+
+    lines = [
+        header,
+        f"Market Close: `{snapshot['market_close_date']}` | Last TPI: `{snapshot['last_tpi_release_date']}`",
+        f"Regime Duration: `{snapshot['days_in_regime']}d` (since `{snapshot['last_transition_date']}`)",
+        "",
+        "*Indicators:*",
+        f"• TPI: `${snapshot['tpi_price']:.2f}` ({snapshot['tpi_release_wow_pct']:+.1f}% WoW) vs {ema_span}d EMA `${snapshot['tpi_ema25']:.2f}` (`{snapshot['tpi_ema_spread_pct']:+.2f}%`)",
+        f"• Dollar Spend: `{snapshot['implied_spend_idx']:.2f}` vs EMA `{snapshot['spend_ema25']:.2f}` (`{snapshot['spend_ema_spread_pct']:+.2f}%`)",
+        f"• SMH: `${snapshot['smh_close']:.2f}` vs 20d SMA `${snapshot['smh_sma20']:.2f}` ({'ABOVE' if snapshot['smh_above_sma20'] else 'BELOW'})",
+        f"• EW Basket: `{snapshot['basket_idx']:.2f}` vs 20d SMA `{snapshot['basket_sma20']:.2f}` ({'ABOVE' if snapshot['basket_above_sma20'] else 'BELOW'})",
+        f"• {streak_line}",
+        "",
+        "*Target Allocation (Next Open):*",
+        f"• Rotation: `{snapshot['target_rotation_alloc']}`",
+        f"• SMH Hedged: `{snapshot['target_smh_hedged_alloc']}`",
+    ]
+    return "\n".join(lines)
+
+def send_telegram_alert(
+    snapshot: dict,
+    logger,
+    mode: str = "always",
+    ema_span: int = 25,
+) -> bool:
+    """
+    Sends an outbound Telegram notification using standard-library `urllib` when
+    `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set in environment variables.
+    Modes:
+      - `always`    : Send summary on every run (default)
+      - `flip-only` : Send message only when `snapshot["flipped_today"]` is True
+      - `off`       : Disable Telegram alerts
+    """
+    if mode == "off":
+        log_and_print("[TELEGRAM] Notifications disabled (--telegram-mode off).", logger=logger)
+        return False
+
+    if mode == "flip-only" and not snapshot["flipped_today"]:
+        log_and_print(
+            "[TELEGRAM] No regime flip today — skipping alert (--telegram-mode flip-only).",
+            logger=logger,
+        )
+        return False
+
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not bot_token or not chat_id:
+        log_and_print(
+            "[TELEGRAM] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — skipping notification.",
+            logger=logger,
+        )
+        return False
+
+    message_text = format_telegram_message(snapshot, ema_span=ema_span)
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = json.dumps(
+        {
+            "chat_id": chat_id,
+            "text": message_text,
+            "parse_mode": "Markdown",
+        }
+    ).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp_body = json.loads(resp.read().decode("utf-8"))
+        if resp_body.get("ok"):
+            log_and_print("[TELEGRAM] Sent notification successfully.", logger=logger)
+            return True
+        log_and_print(
+            f"[WARN] Telegram API returned non-ok response: {resp_body}",
+            level="warning",
+            logger=logger,
+        )
+        return False
+    except Exception as exc:
+        log_and_print(
+            f"[WARN] Failed to send Telegram notification ({exc}).",
+            level="warning",
+            logger=logger,
+        )
+        return False
 
 def log_weekly_signal_to_csv(
     snapshot: dict,
@@ -191,7 +292,6 @@ def log_weekly_signal_to_csv(
         logger=logger,
     )
     return csv_path
-
 
 def print_live_weekly_signal_monitor(
     snapshot: dict,
@@ -293,11 +393,7 @@ def print_live_weekly_signal_monitor(
     log_and_print(f"       • Risk-On Basket Rotation : {snapshot['target_rotation_alloc']}", logger=logger)
     print("=" * 94)
 
-
-# ==============================================================================
-# 2. CLI ARGUMENT PARSER & DAILY CHECK PIPELINE
-# ==============================================================================
-
+# ==============================================================================# 2. CLI ARGUMENT PARSER & DAILY CHECK PIPELINE# ==============================================================================
 
 def parse_daily_check_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -322,13 +418,18 @@ def parse_daily_check_args() -> argparse.Namespace:
         help="Optional explicit CSV path override (defaults to log/signal_monitor_YYYY-MM.csv).",
     )
     parser.add_argument(
+        "--telegram-mode",
+        choices=["always", "flip-only", "off"],
+        default="always",
+        help="Telegram notification trigger mode: 'always' (default), 'flip-only', or 'off'.",
+    )
+    parser.add_argument(
         "--use-live-alt-api",
         action="store_true",
         help="Use live daily CC BY 4.0 feed from aitokenprice.com instead of the weekly TPI table.",
     )
     args, _ = parser.parse_known_args()
     return args
-
 
 def main() -> None:
     args = parse_daily_check_args()
@@ -411,11 +512,18 @@ def main() -> None:
             log_dir=args.log_dir,
             custom_csv_path=args.log_path,
         )
+        send_telegram_alert(
+            snapshot=snapshot,
+            logger=logger,
+            mode=args.telegram_mode,
+            ema_span=ema_span,
+        )
         logger.info("Daily check completed successfully.")
     except Exception as exc:
         logger.exception(f"Unhandled exception during daily check: {exc}")
         raise
 
-
 if __name__ == "__main__":
     main()
+
+
