@@ -1,0 +1,65 @@
+name: Daily AI Token & Semiconductor Signal Check
+
+on:
+  # Runs Tue–Sat at 23:37 UTC (07:37 AM HKT), right after the U.S. market close
+  schedule:
+    - cron: '37 23 * * 2-6'
+
+  # Enables one-click manual runs from GitHub Actions UI with optional inputs
+  workflow_dispatch:
+    inputs:
+      add_tpi:
+        description: 'Optional new Friday TPI print (format: YYYY-MM-DD:PRICE)'
+        required: false
+        default: ''
+      telegram_mode:
+        description: 'Telegram alert mode (always, flip-only, or off)'
+        required: false
+        default: 'always'
+
+permissions:
+  contents: write  # Allows GitHub Actions to commit updated CSV/log files back to your repo
+
+jobs:
+  run-daily-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Set Up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 3. Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 4. Run Daily Signal Monitor & Send Telegram Alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ADD_TPI_INPUT: ${{ github.event.inputs.add_tpi }}
+          TG_MODE: ${{ github.event.inputs.telegram_mode || 'always' }}
+        run: |
+          if [ -n "$ADD_TPI_INPUT" ]; then
+            python src/daily_check.py --telegram-mode "$TG_MODE" --add-tpi "$ADD_TPI_INPUT"
+          else
+            python src/daily_check.py --telegram-mode "$TG_MODE"
+          fi
+
+      - name: 5. Commit Monthly Logs & CSV Snapshots
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add log/ tpi_history.json *.csv || true
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update daily TPI & semiconductor signal log ($(date -u +'%Y-%m-%d'))"
+            git push
+          else
+            echo "No new log changes to commit."
+          fi
