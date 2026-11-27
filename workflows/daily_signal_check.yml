@@ -3,7 +3,7 @@ name: Daily AI Token & Semiconductor Signal Check
 on:
   # Runs Tue–Sat at 23:37 UTC (07:37 AM HKT), right after the U.S. market close
   schedule:
-    - cron: '37 23 * * 2-6'
+    - cron: '30 21 * * 2-6'
 
   # Enables one-click manual runs from GitHub Actions UI with optional inputs
   workflow_dispatch:
