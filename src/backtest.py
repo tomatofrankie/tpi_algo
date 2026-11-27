@@ -42,7 +42,7 @@ try:
 except ImportError:
     mdates = None
     plt = None
-
+    
 # ==============================================================================# 1. MONTHLY ROTATING FILE LOGGER (`log/<prefix>_YYYY-MM.log`)# ==============================================================================
 
 class MonthlyFileHandler(logging.Handler):
@@ -458,7 +458,7 @@ def generate_hysteresis_regime(
         return regime_series, diag
     return regime_series
 
-# ==============================================================================# 4. BACKTEST PERFORMANCE, SENSITIVITY GRID & BASKET ROTATION ENGINES# ==============================================================================
+# ==============================================================================# 4. BACKTEST PERFORMANCE, STOP-LOSS + RE-ENTRY ENGINE, SENSITIVITY & ROTATION# ==============================================================================
 
 def evaluate_allocation_backtest(
     asset_close: pd.Series,
@@ -466,15 +466,119 @@ def evaluate_allocation_backtest(
     defensive_weight: float = 0.0,
     tx_cost_bps: float = 5.0,
     risk_free_annual: float = 0.0425,
-) -> tuple[pd.Series, dict]:
-    """Computes daily equity curve and risk-adjusted metrics with 1-day execution lag."""
+    risk_on_trail_stop: Optional[float] = None,
+    defensive_short_stop: Optional[float] = None,
+    reentry_sma_days: Optional[int] = None,
+    return_events: bool = False,
+):
+    """
+    Computes daily equity curve and risk-adjusted metrics with 1-day execution lag
+    and optional dual stop-loss + 20d-SMA re-entry reset protection:
+      - `risk_on_trail_stop` (e.g., 0.10 for -10% trailing stop):
+            During RISK-ON, tracks the peak closing price of the active Risk-On
+            sleeve since entry. If the close drops >= `risk_on_trail_stop` below
+            its peak, stops out to `0% Cash` at the next open.
+      - `reentry_sma_days` (e.g., 3 for 3 consecutive closes > 20d SMA):
+            When stopped out in `0% Cash` during an active RISK-ON macro regime,
+            if `reentry_sma_days` is set, re-enters `100%` Risk-On once the asset
+            closes above its 20-day SMA for `reentry_sma_days` consecutive days
+            (resetting the trailing peak at the re-entry close). If `None`, stays
+            in cash until the macro regime cycles through DEFENSIVE and back.
+      - `defensive_short_stop` (e.g., 0.08 for +8% short-squeeze cover stop):
+            During DEFENSIVE with a short hedge (`defensive_weight < 0`), covers
+            to `0% Cash` if the underlying rallies >= `defensive_short_stop` above
+            defensive entry.
+    """
+    idx = asset_close.index
     asset_ret = asset_close.pct_change().fillna(0.0)
+    asset_sma20 = asset_close.rolling(20, min_periods=1).mean()
     rf_daily = (1.0 + risk_free_annual) ** (1.0 / 252.0) - 1.0
 
-    target_weight = pd.Series(
-        np.where(defensive_regime, defensive_weight, 1.0),
-        index=asset_close.index,
-    )
+    target_weights = []
+    events: list[dict] = []
+
+    prev_regime_def = None
+    risk_on_peak = float(asset_close.iloc[0])
+    risk_on_stopped = False
+    reentry_streak = 0
+
+    def_entry_px = float(asset_close.iloc[0])
+    def_short_stopped = False
+
+    for dt, px in asset_close.items():
+        px_val = float(px)
+        sma_val = float(asset_sma20.loc[dt])
+        is_def = bool(defensive_regime.loc[dt])
+
+        # Reset stop latches when macro regime transitions
+        if prev_regime_def is None or is_def != prev_regime_def:
+            if not is_def:
+                risk_on_peak = px_val
+                risk_on_stopped = False
+                reentry_streak = 0
+            else:
+                def_entry_px = px_val
+                def_short_stopped = False
+            prev_regime_def = is_def
+
+        if not is_def:
+            if not risk_on_stopped:
+                if px_val > risk_on_peak:
+                    risk_on_peak = px_val
+                dd_from_peak = (px_val / risk_on_peak) - 1.0
+                if risk_on_trail_stop is not None and dd_from_peak <= -abs(risk_on_trail_stop):
+                    risk_on_stopped = True
+                    reentry_streak = 0
+                    events.append(
+                        {
+                            "date": dt.strftime("%Y-%m-%d"),
+                            "type": "RISK-ON TRAILING STOP",
+                            "price": px_val,
+                            "anchor": risk_on_peak,
+                            "move_pct": dd_from_peak * 100.0,
+                        }
+                    )
+            else:
+                # Check optional 20d-SMA re-entry reset while TPI remains RISK-ON
+                if reentry_sma_days is not None and reentry_sma_days > 0:
+                    if px_val > sma_val:
+                        reentry_streak += 1
+                        if reentry_streak >= reentry_sma_days:
+                            risk_on_stopped = False
+                            risk_on_peak = px_val
+                            reentry_streak = 0
+                            events.append(
+                                {
+                                    "date": dt.strftime("%Y-%m-%d"),
+                                    "type": f"SMA20 RE-ENTRY ({reentry_sma_days}d)",
+                                    "price": px_val,
+                                    "anchor": sma_val,
+                                    "move_pct": ((px_val / sma_val) - 1.0) * 100.0,
+                                }
+                            )
+                    else:
+                        reentry_streak = 0
+
+            w = 0.0 if risk_on_stopped else 1.0
+        else:
+            if defensive_weight < 0.0 and not def_short_stopped:
+                rally_from_entry = (px_val / def_entry_px) - 1.0
+                if defensive_short_stop is not None and rally_from_entry >= abs(defensive_short_stop):
+                    def_short_stopped = True
+                    events.append(
+                        {
+                            "date": dt.strftime("%Y-%m-%d"),
+                            "type": "DEFENSIVE SHORT COVER STOP",
+                            "price": px_val,
+                            "anchor": def_entry_px,
+                            "move_pct": rally_from_entry * 100.0,
+                        }
+                    )
+            w = 0.0 if def_short_stopped else defensive_weight
+
+        target_weights.append(w)
+
+    target_weight = pd.Series(target_weights, index=idx)
     exec_weight = target_weight.shift(1).fillna(1.0)
     cash_weight = 1.0 - exec_weight.abs()
 
@@ -491,16 +595,24 @@ def evaluate_allocation_backtest(
     rolling_peak = equity.cummax()
     max_dd = float(((equity / rolling_peak) - 1.0).min())
 
+    stop_count = sum(1 for e in events if "STOP" in e["type"])
+    reentry_count = sum(1 for e in events if "RE-ENTRY" in e["type"])
+
     stats = {
         "Total Return": f"{total_ret:.2%}",
         "Annualized Vol": f"{ann_vol:.2%}",
         "Sharpe Ratio": f"{sharpe:.2f}",
         "Max Drawdown": f"{max_dd:.2%}",
+        "Stops / Re-Entries": f"{stop_count} / {reentry_count}",
         "Ending Value ($10k)": f"${equity.iloc[-1]:,.2f}",
         "_raw_total_ret": total_ret,
         "_raw_sharpe": sharpe,
         "_raw_max_dd": max_dd,
+        "_stop_count": stop_count,
+        "_reentry_count": reentry_count,
     }
+    if return_events:
+        return equity, stats, events
     return equity, stats
 
 def run_parameter_sensitivity_grid(
@@ -615,11 +727,14 @@ def run_risk_on_basket_rotation(
     entry_ema_thresh: float = -0.03,
     tx_cost_bps: float = 10.0,
     risk_free_annual: float = 0.0425,
+    risk_on_trail_stop: Optional[float] = None,
+    defensive_short_stop: Optional[float] = None,
+    reentry_sma_days: Optional[int] = None,
 ) -> dict:
     """
     Tests holding an equal-weight high-beta AI compute/memory basket (`MU`, `AMD`,
     `NVDA`, `TSM`) during Risk-On regimes and rotating into `0% Cash` or `-25% SMH`
-    during Defensive regimes.
+    during Defensive regimes, with optional dual stop-loss and 20d-SMA re-entry reset.
     """
     idx = base_signals.index
     rf_daily = (1.0 + risk_free_annual) ** (1.0 / 252.0) - 1.0
@@ -629,12 +744,14 @@ def run_risk_on_basket_rotation(
         index=idx,
     )
     basket_idx = 100.0 * norm_prices.mean(axis=1)
+    basket_sma20 = basket_idx.rolling(20, min_periods=1).mean()
     basket_ret = norm_prices.pct_change().fillna(0.0).mean(axis=1)
-    smh_ret = base_signals["smh_close"].pct_change().fillna(0.0)
+    smh_close = base_signals["smh_close"]
+    smh_ret = smh_close.pct_change().fillna(0.0)
 
     rot_sig = base_signals.copy()
     rot_sig["basket_idx"] = basket_idx
-    rot_sig["basket_sma20"] = basket_idx.rolling(20, min_periods=1).mean()
+    rot_sig["basket_sma20"] = basket_sma20
 
     rot_regime = generate_hysteresis_regime(
         rot_sig,
@@ -644,19 +761,104 @@ def run_risk_on_basket_rotation(
         sma_col="basket_sma20",
     )
 
-    def _compute_curve(defensive_smh_weight: Optional[float]) -> tuple[pd.Series, dict]:
+    def _compute_curve(defensive_smh_weight: Optional[float]) -> tuple[pd.Series, dict, list[dict]]:
+        events: list[dict] = []
         if defensive_smh_weight is None:
             strat_ret = basket_ret
         else:
-            is_def_exec = rot_regime.shift(1).fillna(False)
-            flips = is_def_exec.ne(is_def_exec.shift(1)).astype(float)
+            modes = []
+            prev_def = None
+            ro_peak = float(basket_idx.iloc[0])
+            ro_stopped = False
+            reentry_streak = 0
+            def_entry_smh = float(smh_close.iloc[0])
+            def_stopped = False
+
+            for dt in idx:
+                is_def = bool(rot_regime.loc[dt])
+                b_px = float(basket_idx.loc[dt])
+                b_sma = float(basket_sma20.loc[dt])
+                s_px = float(smh_close.loc[dt])
+
+                if prev_def is None or is_def != prev_def:
+                    if not is_def:
+                        ro_peak = b_px
+                        ro_stopped = False
+                        reentry_streak = 0
+                    else:
+                        def_entry_smh = s_px
+                        def_stopped = False
+                    prev_def = is_def
+
+                if not is_def:
+                    if not ro_stopped:
+                        if b_px > ro_peak:
+                            ro_peak = b_px
+                        dd = (b_px / ro_peak) - 1.0
+                        if risk_on_trail_stop is not None and dd <= -abs(risk_on_trail_stop):
+                            ro_stopped = True
+                            reentry_streak = 0
+                            events.append(
+                                {
+                                    "date": dt.strftime("%Y-%m-%d"),
+                                    "type": "BASKET TRAIL STOP",
+                                    "price": b_px,
+                                    "anchor": ro_peak,
+                                    "move_pct": dd * 100.0,
+                                }
+                            )
+                    else:
+                        if reentry_sma_days is not None and reentry_sma_days > 0:
+                            if b_px > b_sma:
+                                reentry_streak += 1
+                                if reentry_streak >= reentry_sma_days:
+                                    ro_stopped = False
+                                    ro_peak = b_px
+                                    reentry_streak = 0
+                                    events.append(
+                                        {
+                                            "date": dt.strftime("%Y-%m-%d"),
+                                            "type": f"SMA20 RE-ENTRY ({reentry_sma_days}d)",
+                                            "price": b_px,
+                                            "anchor": b_sma,
+                                            "move_pct": ((b_px / b_sma) - 1.0) * 100.0,
+                                        }
+                                    )
+                            else:
+                                reentry_streak = 0
+
+                    modes.append("CASH_STOPPED" if ro_stopped else "RISK_ON")
+                else:
+                    if defensive_smh_weight < 0.0 and not def_stopped:
+                        rally = (s_px / def_entry_smh) - 1.0
+                        if defensive_short_stop is not None and rally >= abs(defensive_short_stop):
+                            def_stopped = True
+                            events.append(
+                                {
+                                    "date": dt.strftime("%Y-%m-%d"),
+                                    "type": "DEFENSIVE SMH SHORT STOP",
+                                    "price": s_px,
+                                    "anchor": def_entry_smh,
+                                    "move_pct": rally * 100.0,
+                                }
+                            )
+                    modes.append("CASH_STOPPED" if def_stopped else "DEFENSIVE")
+
+            mode_series = pd.Series(modes, index=idx)
+            exec_mode = mode_series.shift(1).fillna("RISK_ON")
+            flips = exec_mode.ne(exec_mode.shift(1)).astype(float)
             flips.iloc[0] = 0.0
             costs = flips * (tx_cost_bps / 10000.0)
 
-            risk_on_ret = basket_ret
             cash_w = 1.0 - abs(defensive_smh_weight)
             def_ret = (defensive_smh_weight * smh_ret) + (cash_w * rf_daily)
-            strat_ret = pd.Series(np.where(is_def_exec, def_ret, risk_on_ret), index=idx) - costs
+
+            daily_r = np.where(
+                exec_mode == "RISK_ON",
+                basket_ret,
+                np.where(exec_mode == "DEFENSIVE", def_ret, rf_daily),
+            )
+            strat_ret = pd.Series(daily_r, index=idx) - costs
 
         eq = 10000.0 * (1.0 + strat_ret).cumprod()
         tot_ret = (eq.iloc[-1] / 10000.0) - 1.0
@@ -664,28 +866,39 @@ def run_risk_on_basket_rotation(
         excess = strat_ret - rf_daily
         sharpe = float((excess.mean() / strat_ret.std()) * np.sqrt(252.0)) if strat_ret.std() > 0 else 0.0
         max_dd = float(((eq / eq.cummax()) - 1.0).min())
+
+        stop_count = sum(1 for e in events if "STOP" in e["type"])
+        reentry_count = sum(1 for e in events if "RE-ENTRY" in e["type"])
+
         stats = {
             "Total Return": f"{tot_ret:.2%}",
             "Annualized Vol": f"{ann_vol:.2%}",
             "Sharpe Ratio": f"{sharpe:.2f}",
             "Max Drawdown": f"{max_dd:.2%}",
+            "Stops / Re-Entries": f"{stop_count} / {reentry_count}",
             "Ending Value ($10k)": f"${eq.iloc[-1]:,.2f}",
+            "_raw_total_ret": tot_ret,
+            "_raw_sharpe": sharpe,
+            "_raw_max_dd": max_dd,
+            "_stop_count": stop_count,
+            "_reentry_count": reentry_count,
         }
-        return eq, stats
+        return eq, stats, events
 
-    eq_static, st_static = _compute_curve(None)
-    eq_flat, st_flat = _compute_curve(0.0)
-    eq_hedge, st_hedge = _compute_curve(-0.25)
+    eq_static, st_static, _ = _compute_curve(None)
+    eq_flat, st_flat, ev_flat = _compute_curve(0.0)
+    eq_hedge, st_hedge, ev_hedge = _compute_curve(-0.25)
 
     return {
         "static": {"equity": eq_static, "stats": st_static},
-        "flat": {"equity": eq_flat, "stats": st_flat},
+        "flat": {"equity": eq_flat, "stats": st_flat, "events": ev_flat},
         "hedge": {
             "equity": eq_hedge,
             "stats": st_hedge,
+            "events": ev_hedge,
             "regime": rot_regime,
             "basket_idx": basket_idx,
-            "basket_sma20": rot_sig["basket_sma20"],
+            "basket_sma20": basket_sma20,
         },
     }
 
@@ -700,6 +913,8 @@ def generate_visual_dashboards(
     sharpe_grid: pd.DataFrame,
     basket_curves: dict[str, pd.DataFrame],
     rotation_curves: dict,
+    rotation_curves_stopped: dict,
+    rotation_curves_reentry: dict,
     logger: Optional[logging.Logger] = None,
 ) -> None:
     """Exports the 5-panel SMH dashboard and 6-ticker + rotation comparison chart."""
@@ -721,7 +936,6 @@ def generate_visual_dashboards(
     ax4 = fig.add_subplot(gs[3], sharex=ax1)
     ax5 = fig.add_subplot(gs[4])
 
-    # Shade defensive windows across time-series panels
     in_def = False
     start_span = None
     for dt, flag in defensive_regime.items():
@@ -797,30 +1011,29 @@ def generate_visual_dashboards(
             ax.legend(loc="upper left", fontsize=8)
 
     ax_rot = fig2.add_subplot(gs2[2, :])
-    ax_rot.plot(eq_bh.index, eq_bh, label="Buy & Hold SMH", color="#7f7f7f", ls="--", lw=1.4)
-    ax_rot.plot(
-        rotation_curves["static"]["equity"].index,
-        rotation_curves["static"]["equity"],
-        label="Static EW Basket (MU/AMD/NVDA/TSM)",
-        color="#ff7f0e",
-        ls=":",
-        lw=1.5,
-    )
-    ax_rot.plot(
-        rotation_curves["flat"]["equity"].index,
-        rotation_curves["flat"]["equity"],
-        label="Rotation -> 0% Cash Defensive",
-        color="#1f77b4",
-        lw=1.8,
-    )
+    ax_rot.plot(eq_bh.index, eq_bh, label="Buy & Hold SMH", color="#7f7f7f", ls="--", lw=1.3)
     ax_rot.plot(
         rotation_curves["hedge"]["equity"].index,
         rotation_curves["hedge"]["equity"],
-        label="Rotation -> -25% SMH Short Defensive",
-        color="#2ca02c",
-        lw=2.1,
+        label="Rotation -> -25% SMH (No Stop-Loss)",
+        color="#1f77b4",
+        lw=1.6,
     )
-    ax_rot.set_title("Risk-On Basket Rotation (EW MU/AMD/NVDA/TSM in Risk-On -> Defensive Hedge)", fontweight="bold")
+    ax_rot.plot(
+        rotation_curves_stopped["hedge"]["equity"].index,
+        rotation_curves_stopped["hedge"]["equity"],
+        label="Rotation -> -25% SMH (+ Stop-Loss, Locked Cash)",
+        color="#ff7f0e",
+        lw=1.8,
+    )
+    ax_rot.plot(
+        rotation_curves_reentry["hedge"]["equity"].index,
+        rotation_curves_reentry["hedge"]["equity"],
+        label="Rotation -> -25% SMH (+ Stop-Loss & 3d SMA20 Re-Entry Reset)",
+        color="#2ca02c",
+        lw=2.2,
+    )
+    ax_rot.set_title("Risk-On Basket Rotation: Unstopped vs. Stop-Loss + 3d SMA20 Re-Entry Reset", fontweight="bold")
     ax_rot.legend(loc="upper left")
     ax_rot.grid(True, alpha=0.3)
 
@@ -835,6 +1048,24 @@ def parse_backtest_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="AI Token Pricing & Semiconductor Historical Backtester")
     parser.add_argument("--log-dir", type=str, default="log", help="Directory for monthly backtest logs.")
     parser.add_argument("--no-charts", action="store_true", help="Skip PNG chart generation.")
+    parser.add_argument(
+        "--trail-stop",
+        type=float,
+        default=0.10,
+        help="Risk-On trailing drawdown stop-loss fraction (default: 0.10 = 10%).",
+    )
+    parser.add_argument(
+        "--short-stop",
+        type=float,
+        default=0.08,
+        help="Defensive SMH short-squeeze cover stop fraction (default: 0.08 = +8% rally).",
+    )
+    parser.add_argument(
+        "--reentry-days",
+        type=int,
+        default=3,
+        help="Consecutive closes > 20d SMA to re-enter Risk-On after a trailing stop-out (default: 3).",
+    )
     args, _ = parser.parse_known_args()
     return args
 
@@ -842,10 +1073,10 @@ def main() -> None:
     args = parse_backtest_args()
     logger, active_log = setup_monthly_logger(log_dir=args.log_dir, prefix="backtest", logger_name="tpi_backtest")
 
-    print("=" * 94)
+    print("=" * 102)
     log_and_print("AI TOKEN PRICING & SEMICONDUCTOR HISTORICAL BACKTEST (`backtest.py`)", logger=logger)
     log_and_print(f"[LOG] Active monthly backtest log : {active_log.resolve()}", logger=logger)
-    print("=" * 94)
+    print("=" * 102)
 
     panel = build_aligned_market_panel(start_date="2026-05-15", end_date=None)
     signals = compute_smoothed_signals(panel, ema_span=25)
@@ -856,6 +1087,26 @@ def main() -> None:
     )
     eq_flat, st_flat = evaluate_allocation_backtest(signals["smh_close"], defensive_regime, defensive_weight=0.0)
     eq_hedge, st_hedge = evaluate_allocation_backtest(signals["smh_close"], defensive_regime, defensive_weight=-0.25)
+
+    # SMH Stop-Loss variants: (a) Locked Cash vs. (b) +3d SMA20 Re-Entry Reset
+    _, st_smh_stop_locked, _ = evaluate_allocation_backtest(
+        signals["smh_close"],
+        defensive_regime,
+        defensive_weight=-0.25,
+        risk_on_trail_stop=args.trail_stop,
+        defensive_short_stop=args.short_stop,
+        reentry_sma_days=None,
+        return_events=True,
+    )
+    _, st_smh_stop_reentry, ev_smh_reentry = evaluate_allocation_backtest(
+        signals["smh_close"],
+        defensive_regime,
+        defensive_weight=-0.25,
+        risk_on_trail_stop=args.trail_stop,
+        defensive_short_stop=args.short_stop,
+        reentry_sma_days=args.reentry_days,
+        return_events=True,
+    )
 
     metric_keys = ["Total Return", "Annualized Vol", "Sharpe Ratio", "Max Drawdown", "Ending Value ($10k)"]
     comp_df = pd.DataFrame(
@@ -870,7 +1121,7 @@ def main() -> None:
         f"Sample Window : {signals.index[0].strftime('%Y-%m-%d')} to {signals.index[-1].strftime('%Y-%m-%d')} "
         f"({len(signals)} trading days)\n"
         f"[1] SMH Defensive Allocation Comparison (Base: 25d EMA, -3% Entry, 3d Hysteresis)\n"
-        + "-" * 94
+        + "-" * 102
         + f"\n{comp_df.to_string()}",
         logger=logger,
     )
@@ -878,6 +1129,20 @@ def main() -> None:
     sharpe_grid, _, rob_summary = run_parameter_sensitivity_grid(panel)
     basket_df, basket_curves = run_semiconductor_basket_comparison(signals)
     rotation_curves = run_risk_on_basket_rotation(signals, basket_curves)
+    rotation_curves_stopped = run_risk_on_basket_rotation(
+        signals,
+        basket_curves,
+        risk_on_trail_stop=args.trail_stop,
+        defensive_short_stop=args.short_stop,
+        reentry_sma_days=None,
+    )
+    rotation_curves_reentry = run_risk_on_basket_rotation(
+        signals,
+        basket_curves,
+        risk_on_trail_stop=args.trail_stop,
+        defensive_short_stop=args.short_stop,
+        reentry_sma_days=args.reentry_days,
+    )
 
     rot_df = pd.DataFrame(
         {
@@ -890,13 +1155,58 @@ def main() -> None:
     )
     log_and_print(
         "\n[2] Cross-Sectional Semiconductor Basket Comparison (Live yfinance Data)\n"
-        + "-" * 94
+        + "-" * 102
         + f"\n{basket_df.to_string()}\n\n"
         + "[3] Risk-On Basket Rotation Strategy (EW MU/AMD/NVDA/TSM in Risk-On)\n"
-        + "-" * 94
+        + "-" * 102
         + f"\n{rot_df.to_string()}\n\n"
         + f"[4] SMH Robustness Check : Median Sharpe = {rob_summary['median_sharpe']:+.2f} | "
         f"Median Return = {rob_summary['median_ret']:+.2%} | Cells Beating B&H = {rob_summary['pct_beating_bh']:.0f}%",
+        logger=logger,
+    )
+
+    # Three-way Stop-Loss & Re-Entry Reset Comparison
+    stop_metric_keys = [
+        "Total Return",
+        "Annualized Vol",
+        "Sharpe Ratio",
+        "Max Drawdown",
+        "Stops / Re-Entries",
+        "Ending Value ($10k)",
+    ]
+    stop_comp_df = pd.DataFrame(
+        {
+            "SMH -25% (No Stop)": [st_hedge[k] for k in stop_metric_keys],
+            "SMH -25% (Stop Lock)": [st_smh_stop_locked[k] for k in stop_metric_keys],
+            "SMH -25% (Stop+ReEntry)": [st_smh_stop_reentry[k] for k in stop_metric_keys],
+            "Rot -25% (No Stop)": [rotation_curves["hedge"]["stats"][k] for k in stop_metric_keys],
+            "Rot -25% (Stop Lock)": [rotation_curves_stopped["hedge"]["stats"][k] for k in stop_metric_keys],
+            "Rot -25% (Stop+ReEntry)": [rotation_curves_reentry["hedge"]["stats"][k] for k in stop_metric_keys],
+        },
+        index=stop_metric_keys,
+    )
+
+    event_lines = []
+    for label, ev_list in [
+        ("SMH -25% (Stop+ReEntry)", ev_smh_reentry),
+        ("Rot -25% (Stop+ReEntry)", rotation_curves_reentry["hedge"]["events"]),
+    ]:
+        if ev_list:
+            for ev in ev_list:
+                event_lines.append(
+                    f"    • [{label}] {ev['date']} : {ev['type']} "
+                    f"(Price: {ev['price']:.2f} vs Anchor {ev['anchor']:.2f}, Move: {ev['move_pct']:+.2f}%)"
+                )
+        else:
+            event_lines.append(f"    • [{label}] No stop-loss or re-entry triggered during sample window.")
+
+    log_and_print(
+        f"\n[5] Stop-Loss + {args.reentry_days}d SMA20 Re-Entry Improvement "
+        f"(Trail: -{args.trail_stop:.0%} | Short Cover: +{args.short_stop:.0%})\n"
+        + "-" * 102
+        + f"\n{stop_comp_df.to_string()}\n"
+        + "    Triggered Stop & Re-Entry Timeline:\n"
+        + "\n".join(event_lines),
         logger=logger,
     )
 
@@ -910,6 +1220,8 @@ def main() -> None:
             sharpe_grid=sharpe_grid,
             basket_curves=basket_curves,
             rotation_curves=rotation_curves,
+            rotation_curves_stopped=rotation_curves_stopped,
+            rotation_curves_reentry=rotation_curves_reentry,
             logger=logger,
         )
 

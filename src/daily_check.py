@@ -31,9 +31,6 @@ Usage:
 
 import argparse
 import sys
-import os
-import json
-import urllib.request
 from pathlib import Path
 from typing import Optional
 import pandas as pd
@@ -60,7 +57,93 @@ from backtest import (  # noqa: E402
     setup_monthly_logger,
 )
 
-# ==============================================================================# 1. SNAPSHOT BUILDER, TELEGRAM NOTIFIER & MONTHLY CSV SIGNAL LOGGER# ==============================================================================
+# ==============================================================================# 1. SNAPSHOT BUILDER (WITH STOP LOCK), TELEGRAM NOTIFIER & MONTHLY CSV LOGGER# ==============================================================================
+
+def evaluate_live_stop_lock_state(
+    asset_close: pd.Series,
+    defensive_regime: pd.Series,
+    trail_stop: float = 0.10,
+    short_stop: float = 0.08,
+) -> dict:
+    """
+    Replays the stateful Stop Lock latch across the historical series up to today:
+      - In RISK-ON : tracks peak close since entry; latches `stopped = True` if
+                     close drops >= `trail_stop` below peak (stays locked in
+                     0% Cash until macro regime cycles through DEFENSIVE).
+      - In DEFENSIVE: tracks SMH close when DEFENSIVE began; latches `stopped = True`
+                     if SMH rallies >= `short_stop` above entry (covers short to
+                     0% Cash for the remainder of that DEFENSIVE cycle).
+    """
+    prev_def = None
+    ro_peak = float(asset_close.iloc[0])
+    ro_stopped = False
+    ro_stop_date: Optional[str] = None
+
+    def_entry_px = float(asset_close.iloc[0])
+    def_stopped = False
+    def_stop_date: Optional[str] = None
+
+    state_history: list[str] = []
+
+    for dt, px in asset_close.items():
+        px_val = float(px)
+        is_def = bool(defensive_regime.loc[dt])
+
+        if prev_def is None or is_def != prev_def:
+            if not is_def:
+                ro_peak = px_val
+                ro_stopped = False
+                ro_stop_date = None
+            else:
+                def_entry_px = px_val
+                def_stopped = False
+                def_stop_date = None
+            prev_def = is_def
+
+        if not is_def:
+            if not ro_stopped:
+                if px_val > ro_peak:
+                    ro_peak = px_val
+                if (px_val / ro_peak) - 1.0 <= -abs(trail_stop):
+                    ro_stopped = True
+                    ro_stop_date = dt.strftime("%Y-%m-%d")
+            state_history.append("STOP_LOCKED_CASH" if ro_stopped else "RISK_ON")
+        else:
+            if not def_stopped:
+                if (px_val / def_entry_px) - 1.0 >= abs(short_stop):
+                    def_stopped = True
+                    def_stop_date = dt.strftime("%Y-%m-%d")
+            state_history.append("STOP_LOCKED_CASH" if def_stopped else "DEFENSIVE")
+
+    curr_state = state_history[-1]
+    prev_state = state_history[-2] if len(state_history) >= 2 else curr_state
+    curr_px = float(asset_close.iloc[-1])
+    is_def_now = bool(defensive_regime.iloc[-1])
+
+    if not is_def_now:
+        stop_trigger_px = ro_peak * (1.0 - abs(trail_stop))
+        dist_to_stop_pct = ((curr_px / stop_trigger_px) - 1.0) * 100.0
+        return {
+            "effective_state": curr_state,
+            "state_changed_today": curr_state != prev_state,
+            "is_stop_locked": ro_stopped,
+            "stop_triggered_date": ro_stop_date or "",
+            "anchor_price": round(ro_peak, 2),
+            "stop_trigger_price": round(stop_trigger_px, 2),
+            "distance_to_stop_pct": round(dist_to_stop_pct, 2),
+        }
+    else:
+        stop_trigger_px = def_entry_px * (1.0 + abs(short_stop))
+        dist_to_stop_pct = ((stop_trigger_px / curr_px) - 1.0) * 100.0
+        return {
+            "effective_state": curr_state,
+            "state_changed_today": curr_state != prev_state,
+            "is_stop_locked": def_stopped,
+            "stop_triggered_date": def_stop_date or "",
+            "anchor_price": round(def_entry_px, 2),
+            "stop_trigger_price": round(stop_trigger_px, 2),
+            "distance_to_stop_pct": round(dist_to_stop_pct, 2),
+        }
 
 def build_live_signal_snapshot(
     signals: pd.DataFrame,
@@ -71,10 +154,12 @@ def build_live_signal_snapshot(
     confirm_days: int = 3,
     entry_ema_thresh: float = -0.03,
     exit_ema_thresh: float = 0.00,
+    trail_stop: float = 0.10,
+    short_stop: float = 0.08,
 ) -> dict:
     """
-    Computes a structured dictionary of current regime diagnostics, next-Friday
-    TPI trigger levels, and target portfolio allocations.
+    Computes a structured dictionary of current regime diagnostics, Stop Lock
+    levels, next-Friday TPI trigger levels, and target portfolio allocations.
     """
     latest = signals.iloc[-1]
     latest_dt = signals.index[-1]
@@ -82,8 +167,8 @@ def build_live_signal_snapshot(
 
     is_def_now = bool(defensive_regime.iloc[-1])
     prev_is_def = bool(defensive_regime.iloc[-2]) if len(defensive_regime) >= 2 else is_def_now
-    flipped_today = is_def_now != prev_is_def
-    regime_label = "DEFENSIVE" if is_def_now else "RISK-ON"
+    macro_flipped_today = is_def_now != prev_is_def
+    macro_regime_label = "DEFENSIVE" if is_def_now else "RISK-ON"
 
     days_in_regime = 0
     for val in reversed(defensive_regime.values):
@@ -108,16 +193,54 @@ def build_live_signal_snapshot(
     tpi_exit_trigger = solve_tpi_for_spread(exit_ema_thresh)
 
     rot_df = rotation_curves["hedge"]
-    basket_px = float(rot_df["basket_idx"].iloc[-1])
+    basket_series = rot_df["basket_idx"]
+    basket_px = float(basket_series.iloc[-1])
     basket_sma = float(rot_df["basket_sma20"].iloc[-1])
-    smh_px = float(latest["smh_close"])
+    smh_series = signals["smh_close"]
+    smh_px = float(smh_series.iloc[-1])
     smh_sma = float(latest["smh_sma20"])
+
+    # Evaluate Stop Lock state for SMH Overlay and Risk-On Basket Rotation
+    smh_stop_info = evaluate_live_stop_lock_state(
+        asset_close=smh_series,
+        defensive_regime=defensive_regime,
+        trail_stop=trail_stop,
+        short_stop=short_stop,
+    )
+    rot_stop_info = evaluate_live_stop_lock_state(
+        asset_close=basket_series if not is_def_now else smh_series,
+        defensive_regime=defensive_regime,
+        trail_stop=trail_stop,
+        short_stop=short_stop,
+    )
+
+    flipped_today = macro_flipped_today or smh_stop_info["state_changed_today"] or rot_stop_info["state_changed_today"]
+
+    # Effective target allocations incorporating Stop Lock
+    if smh_stop_info["is_stop_locked"]:
+        target_smh_flat = "0% SMH / 100% Cash (Stop Locked)"
+        target_smh_hedged = "0% SMH / 100% Cash (Stop Locked)"
+    elif is_def_now:
+        target_smh_flat = "0% SMH / 100% Cash"
+        target_smh_hedged = "-25% Short SMH / 100% Cash"
+    else:
+        target_smh_flat = "100% Long SMH"
+        target_smh_hedged = "100% Long SMH"
+
+    if rot_stop_info["is_stop_locked"]:
+        target_rotation = "0% Basket / 100% Cash (Stop Locked)"
+    elif is_def_now:
+        target_rotation = "0% Basket -> -25% Short SMH (or 100% Cash)"
+    else:
+        target_rotation = "25% MU, 25% AMD, 25% NVDA, 25% TSM"
 
     return {
         "run_timestamp_utc": pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
         "market_close_date": latest_dt.strftime("%Y-%m-%d"),
         "last_tpi_release_date": last_tpi_rel.strftime("%Y-%m-%d"),
-        "active_regime": regime_label,
+        "active_regime": macro_regime_label,
+        "effective_smh_state": smh_stop_info["effective_state"],
+        "effective_rot_state": rot_stop_info["effective_state"],
         "flipped_today": flipped_today,
         "days_in_regime": days_in_regime,
         "last_transition_date": last_flip_dt.strftime("%Y-%m-%d"),
@@ -138,50 +261,84 @@ def build_live_signal_snapshot(
         "exit_streak": f"{diag['exit_streak']}/{confirm_days}",
         "next_friday_tpi_entry_trigger": round(tpi_entry_trigger, 4),
         "next_friday_tpi_exit_trigger": round(tpi_exit_trigger, 4),
-        "target_smh_flat_alloc": "0% SMH / 100% Cash" if is_def_now else "100% Long SMH",
-        "target_smh_hedged_alloc": "-25% Short SMH / 100% Cash" if is_def_now else "100% Long SMH",
-        "target_rotation_alloc": (
-            "0% Basket -> -25% Short SMH (or 100% Cash)"
-            if is_def_now
-            else "25% MU, 25% AMD, 25% NVDA, 25% TSM"
-        ),
+        "trail_stop_pct": round(trail_stop * 100, 1),
+        "short_stop_pct": round(short_stop * 100, 1),
+        "smh_stop_locked": smh_stop_info["is_stop_locked"],
+        "smh_stop_date": smh_stop_info["stop_triggered_date"],
+        "smh_stop_anchor": smh_stop_info["anchor_price"],
+        "smh_stop_trigger_px": smh_stop_info["stop_trigger_price"],
+        "smh_dist_to_stop_pct": smh_stop_info["distance_to_stop_pct"],
+        "rot_stop_locked": rot_stop_info["is_stop_locked"],
+        "rot_stop_date": rot_stop_info["stop_triggered_date"],
+        "rot_stop_anchor": rot_stop_info["anchor_price"],
+        "rot_stop_trigger_px": rot_stop_info["stop_trigger_price"],
+        "rot_dist_to_stop_pct": rot_stop_info["distance_to_stop_pct"],
+        "target_smh_flat_alloc": target_smh_flat,
+        "target_smh_hedged_alloc": target_smh_hedged,
+        "target_rotation_alloc": target_rotation,
     }
 
-def format_telegram_message(snapshot: dict, ema_span: int = 25) -> str:
-    """Builds a clean, mobile-friendly Telegram message from the daily snapshot."""
+def format_telegram_message(snapshot: dict) -> str:
+    """
+    Builds a concise, user-friendly Telegram notification focusing on the
+    active regime, Stop Lock status/trigger level, and target allocations
+    (detailed indicator readings intentionally omitted).
+    """
     is_def = snapshot["active_regime"] == "DEFENSIVE"
-    status_badge = "DEFENSIVE (RISK-OFF)" if is_def else "RISK-ON (BULLISH)"
+    any_stop_locked = snapshot["smh_stop_locked"] or snapshot["rot_stop_locked"]
+
+    if any_stop_locked:
+        status_badge = f"STOP LOCKED -> 100% CASH ({snapshot['active_regime']})"
+    elif is_def:
+        status_badge = "DEFENSIVE (RISK-OFF)"
+    else:
+        status_badge = "RISK-ON (BULLISH)"
+
     header = (
-        f"🚨 *REGIME FLIP DETECTED: {status_badge}*"
+        f"🚨 *ACTION ALERT: {status_badge}*"
         if snapshot["flipped_today"]
-        else f"📊 *AI Token & Semi Signal: {status_badge}*"
+        else f"📊 *Signal Update: {status_badge}*"
     )
 
-    if is_def:
-        streak_line = (
-            f"Exit Streak: `{snapshot['exit_streak']}` | "
-            f"Re-Enter TPI: `>${snapshot['tpi_price']:.2f}` or `>=${snapshot['next_friday_tpi_exit_trigger']:.2f}`"
+    if snapshot["rot_stop_locked"]:
+        stop_line = (
+            f"• Stop Lock: `ACTIVE` since `{snapshot['rot_stop_date']}` "
+            f"(100% Cash until next TPI cycle)"
+        )
+    elif is_def:
+        stop_line = (
+            f"• Short Cover Stop (+{snapshot['short_stop_pct']:.0f}%): "
+            f"`SMH >= ${snapshot['smh_stop_trigger_px']:.2f}` "
+            f"(Current: `${snapshot['smh_close']:.2f}`, Buffer: `{snapshot['smh_dist_to_stop_pct']:+.1f}%`)"
         )
     else:
-        streak_line = (
-            f"Entry Streak: `{snapshot['entry_streak']}` | "
-            f"Defensive TPI: `<=${snapshot['next_friday_tpi_entry_trigger']:.2f}`"
+        stop_line = (
+            f"• Trailing Stop (-{snapshot['trail_stop_pct']:.0f}%): "
+            f"`Basket <= {snapshot['rot_stop_trigger_px']:.2f}` "
+            f"(Peak: `{snapshot['rot_stop_anchor']:.2f}`, Buffer: `{snapshot['rot_dist_to_stop_pct']:+.1f}%`)"
+        )
+
+    if is_def:
+        next_trigger_line = (
+            f"• Next Re-Entry Watch: TPI `>${snapshot['tpi_price']:.2f}` (or `>=${snapshot['next_friday_tpi_exit_trigger']:.2f}`) "
+            f"& 3d > 20d SMA (`{snapshot['exit_streak']}`)"
+        )
+    else:
+        next_trigger_line = (
+            f"• Next Defensive Watch: TPI `<=${snapshot['next_friday_tpi_entry_trigger']:.2f}` "
+            f"for 3d (`{snapshot['entry_streak']}`)"
         )
 
     lines = [
         header,
-        f"Market Close: `{snapshot['market_close_date']}` | Last TPI: `{snapshot['last_tpi_release_date']}`",
-        f"Regime Duration: `{snapshot['days_in_regime']}d` (since `{snapshot['last_transition_date']}`)",
+        f"Close: `{snapshot['market_close_date']}` | TPI: `${snapshot['tpi_price']:.2f}` (`{snapshot['last_tpi_release_date']}`) | Day `{snapshot['days_in_regime']}`",
         "",
-        "*Indicators:*",
-        f"• TPI: `${snapshot['tpi_price']:.2f}` ({snapshot['tpi_release_wow_pct']:+.1f}% WoW) vs {ema_span}d EMA `${snapshot['tpi_ema25']:.2f}` (`{snapshot['tpi_ema_spread_pct']:+.2f}%`)",
-        f"• Dollar Spend: `{snapshot['implied_spend_idx']:.2f}` vs EMA `{snapshot['spend_ema25']:.2f}` (`{snapshot['spend_ema_spread_pct']:+.2f}%`)",
-        f"• SMH: `${snapshot['smh_close']:.2f}` vs 20d SMA `${snapshot['smh_sma20']:.2f}` ({'ABOVE' if snapshot['smh_above_sma20'] else 'BELOW'})",
-        f"• EW Basket: `{snapshot['basket_idx']:.2f}` vs 20d SMA `{snapshot['basket_sma20']:.2f}` ({'ABOVE' if snapshot['basket_above_sma20'] else 'BELOW'})",
-        f"• {streak_line}",
+        "*Risk & Trigger Status:*",
+        stop_line,
+        next_trigger_line,
         "",
         "*Target Allocation (Next Open):*",
-        f"• Rotation: `{snapshot['target_rotation_alloc']}`",
+        f"• Basket Rotation: `{snapshot['target_rotation_alloc']}`",
         f"• SMH Hedged: `{snapshot['target_smh_hedged_alloc']}`",
     ]
     return "\n".join(lines)
@@ -190,7 +347,6 @@ def send_telegram_alert(
     snapshot: dict,
     logger,
     mode: str = "always",
-    ema_span: int = 25,
 ) -> bool:
     """
     Sends an outbound Telegram notification using standard-library `urllib` when
@@ -200,19 +356,23 @@ def send_telegram_alert(
       - `flip-only` : Send message only when `snapshot["flipped_today"]` is True
       - `off`       : Disable Telegram alerts
     """
+    import json as _json
+    import os as _os
+    import urllib.request as _urllib_request
+
     if mode == "off":
         log_and_print("[TELEGRAM] Notifications disabled (--telegram-mode off).", logger=logger)
         return False
 
     if mode == "flip-only" and not snapshot["flipped_today"]:
         log_and_print(
-            "[TELEGRAM] No regime flip today — skipping alert (--telegram-mode flip-only).",
+            "[TELEGRAM] No regime or stop-lock flip today — skipping alert (--telegram-mode flip-only).",
             logger=logger,
         )
         return False
 
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    bot_token = _os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = _os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not bot_token or not chat_id:
         log_and_print(
             "[TELEGRAM] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — skipping notification.",
@@ -220,9 +380,9 @@ def send_telegram_alert(
         )
         return False
 
-    message_text = format_telegram_message(snapshot, ema_span=ema_span)
+    message_text = format_telegram_message(snapshot)
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = json.dumps(
+    payload = _json.dumps(
         {
             "chat_id": chat_id,
             "text": message_text,
@@ -231,13 +391,13 @@ def send_telegram_alert(
     ).encode("utf-8")
 
     try:
-        req = urllib.request.Request(
+        req = _urllib_request.Request(
             url,
             data=payload,
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resp_body = json.loads(resp.read().decode("utf-8"))
+        with _urllib_request.urlopen(req, timeout=15) as resp:
+            resp_body = _json.loads(resp.read().decode("utf-8"))
         if resp_body.get("ok"):
             log_and_print("[TELEGRAM] Sent notification successfully.", logger=logger)
             return True
@@ -313,8 +473,8 @@ def print_live_weekly_signal_monitor(
     if snapshot["flipped_today"]:
         print("!" * 94)
         log_and_print(
-            f"[ALERT] REGIME FLIP DETECTED TODAY ({snapshot['market_close_date']}): "
-            f"NEW REGIME -> {regime_display}",
+            f"[ALERT] REGIME OR STOP-LOCK CHANGE DETECTED TODAY ({snapshot['market_close_date']}): "
+            f"Macro={regime_display} | Rotation State={snapshot['effective_rot_state']}",
             level="warning",
             logger=logger,
         )
@@ -328,7 +488,7 @@ def print_live_weekly_signal_monitor(
         logger=logger,
     )
     log_and_print(
-        f"    Active Signal Regime : {regime_display} "
+        f"    Active Macro Regime  : {regime_display} "
         f"(Active for {snapshot['days_in_regime']} trading days since {snapshot['last_transition_date']})",
         logger=logger,
     )
@@ -360,7 +520,27 @@ def print_live_weekly_signal_monitor(
         logger=logger,
     )
     print("-" * 94)
-    log_and_print("    2. Hysteresis & Next Friday Flip Thresholds:", logger=logger)
+    log_and_print("    2. Stop Lock Risk Status & Trigger Levels:", logger=logger)
+    if snapshot["rot_stop_locked"]:
+        log_and_print(
+            f"       • Basket Stop Lock        : LOCKED IN 100% CASH (Triggered on {snapshot['rot_stop_date']}; "
+            f"resets on next macro TPI cycle)",
+            logger=logger,
+        )
+    elif is_def_now:
+        log_and_print(
+            f"       • Short Cover Stop (+{snapshot['short_stop_pct']:.0f}%): SMH >= ${snapshot['smh_stop_trigger_px']:.2f} "
+            f"(Entry Anchor: ${snapshot['smh_stop_anchor']:.2f}, Current Buffer: {snapshot['smh_dist_to_stop_pct']:+.2f}%)",
+            logger=logger,
+        )
+    else:
+        log_and_print(
+            f"       • Trailing Stop (-{snapshot['trail_stop_pct']:.0f}%): Basket <= {snapshot['rot_stop_trigger_px']:.2f} "
+            f"(Regime Peak: {snapshot['rot_stop_anchor']:.2f}, Current Buffer: {snapshot['rot_dist_to_stop_pct']:+.2f}%)",
+            logger=logger,
+        )
+    print("-" * 94)
+    log_and_print("    3. Hysteresis & Next Friday Flip Thresholds:", logger=logger)
     if is_def_now:
         log_and_print(
             f"       • Exit Confirmation Streak: {snapshot['exit_streak']} consecutive bullish days "
@@ -389,7 +569,7 @@ def print_live_weekly_signal_monitor(
             logger=logger,
         )
     print("-" * 94)
-    log_and_print("    3. Target Portfolio Allocations (Next Trading Open):", logger=logger)
+    log_and_print("    4. Target Portfolio Allocations (Next Trading Open):", logger=logger)
     log_and_print(f"       • SMH Overlay (Flat)      : {snapshot['target_smh_flat_alloc']}", logger=logger)
     log_and_print(f"       • SMH Overlay (Hedged)    : {snapshot['target_smh_hedged_alloc']}", logger=logger)
     log_and_print(f"       • Risk-On Basket Rotation : {snapshot['target_rotation_alloc']}", logger=logger)
@@ -406,6 +586,18 @@ def parse_daily_check_args() -> argparse.Namespace:
         nargs="*",
         default=[],
         help="Append one or more new weekly TPI prints as YYYY-MM-DD:PRICE (e.g., --add-tpi 2026-11-27:1.72).",
+    )
+    parser.add_argument(
+        "--trail-stop",
+        type=float,
+        default=0.10,
+        help="Risk-On trailing drawdown stop-loss fraction (default: 0.10 = -10%).",
+    )
+    parser.add_argument(
+        "--short-stop",
+        type=float,
+        default=0.08,
+        help="Defensive SMH short-squeeze cover stop fraction (default: 0.08 = +8% rally).",
     )
     parser.add_argument(
         "--log-dir",
@@ -488,6 +680,9 @@ def main() -> None:
             confirm_days=confirm_days,
             entry_ema_thresh=entry_ema_thresh,
             tx_cost_bps=10.0,
+            risk_on_trail_stop=args.trail_stop,
+            defensive_short_stop=args.short_stop,
+            reentry_sma_days=None,
         )
 
         snapshot = build_live_signal_snapshot(
@@ -499,6 +694,8 @@ def main() -> None:
             confirm_days=confirm_days,
             entry_ema_thresh=entry_ema_thresh,
             exit_ema_thresh=exit_ema_thresh,
+            trail_stop=args.trail_stop,
+            short_stop=args.short_stop,
         )
         print_live_weekly_signal_monitor(
             snapshot=snapshot,
@@ -518,7 +715,6 @@ def main() -> None:
             snapshot=snapshot,
             logger=logger,
             mode=args.telegram_mode,
-            ema_span=ema_span,
         )
         logger.info("Daily check completed successfully.")
     except Exception as exc:
