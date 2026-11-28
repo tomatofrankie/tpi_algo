@@ -116,3 +116,28 @@
 2026-11-27 06:43:56 [INFO] [LOG] Saved monthly CSV snapshot to: /home/runner/work/tpi_algo/tpi_algo/log/signal_monitor_2026-11.csv (Rows in month file: 1)
 2026-11-27 06:43:56 [INFO] [TELEGRAM] No regime or stop-lock flip today — skipping alert (--telegram-mode flip-only).
 2026-11-27 06:43:56 [INFO] Daily check completed successfully.
+2026-11-28 03:55:01 [INFO] AI TOKEN PRICING & SEMICONDUCTOR DAILY SIGNAL CHECK (`daily_check.py`)
+2026-11-28 03:55:01 [INFO] [LOG] Active monthly check log   : /home/runner/work/tpi_algo/tpi_algo/log/daily_check_2026-11.log
+2026-11-28 03:55:03 [INFO] DAILY / WEEKLY SIGNAL MONITOR READOUT
+2026-11-28 03:55:03 [INFO] As-Of Market Close   : 2026-11-27 | Last Weekly TPI Print : 2026-11-20
+2026-11-28 03:55:03 [INFO] Active Macro Regime  : DEFENSIVE (RISK-OFF) (Active for 43 trading days since 2026-09-29)
+2026-11-28 03:55:03 [INFO] 1. Core Indicator Readings:
+2026-11-28 03:55:03 [INFO] • Weekly TPI Price        : $1.65 / 1M tokens (Last Release WoW: -13.6%)
+2026-11-28 03:55:03 [INFO] • TPI 25-Day EMA Baseline : $1.85 / 1M tokens (Current Spread: -10.75%)
+2026-11-28 03:55:03 [INFO] • Implied Dollar Spend    : 43.77 vs. 25d EMA 44.82 (Spread: -2.34%)
+2026-11-28 03:55:03 [INFO] • SMH Trend Confirmation  : $440.06 vs. 20d SMA $470.51 (BELOW SMA)
+2026-11-28 03:55:03 [INFO] • EW Basket Confirmation  : 86.04 vs. 20d SMA 95.73 (BELOW SMA)
+2026-11-28 03:55:03 [INFO] 2. Stop Lock Risk Status & Trigger Levels:
+2026-11-28 03:55:03 [INFO] • Short Cover Stop (+8%): SMH >= $655.45 (Entry Anchor: $606.90, Current Buffer: +48.95%)
+2026-11-28 03:55:03 [INFO] 3. Hysteresis & Next Friday Flip Thresholds:
+2026-11-28 03:55:03 [INFO] • Exit Confirmation Streak: 0/3 consecutive bullish days (Raw Bullish Today: NO)
+2026-11-28 03:55:03 [INFO] • Conditions to Re-Enter RISK-ON:
+2026-11-28 03:55:03 [INFO] (a) Next Friday TPI prints > $1.65 (positive WoW print) OR >= $1.85 (reclaims 25d EMA), AND
+2026-11-28 03:55:03 [INFO] (b) Asset closes above its 20d SMA (SMH > $470.51 / Basket > 95.73) for 3 straight days.
+2026-11-28 03:55:03 [INFO] 4. Target Portfolio Allocations (Next Trading Open):
+2026-11-28 03:55:03 [INFO] • SMH Overlay (Flat)      : 0% SMH / 100% Cash
+2026-11-28 03:55:03 [INFO] • SMH Overlay (Hedged)    : -25% Short SMH / 100% Cash
+2026-11-28 03:55:03 [INFO] • Risk-On Basket Rotation : 0% Basket -> -25% Short SMH (or 100% Cash)
+2026-11-28 03:55:03 [INFO] [LOG] Saved monthly CSV snapshot to: /home/runner/work/tpi_algo/tpi_algo/log/signal_monitor_2026-11.csv (Rows in month file: 2)
+2026-11-28 03:55:03 [INFO] [TELEGRAM] Sent notification successfully.
+2026-11-28 03:55:03 [INFO] Daily check completed successfully.
